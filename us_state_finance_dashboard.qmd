@@ -1,0 +1,794 @@
+---
+title: "U.S. State Government Finances Dashboard"
+format:
+  html:
+    theme:
+      - ../theme/dashboard-theme.scss
+      - day2-overrides.scss
+    embed-resources: true
+    toc: false
+    page-layout: full
+    html-math-method: plain
+execute:
+  echo: false
+  warning: false
+  message: false
+include-in-header:
+  - ../theme/_plotly-local.html
+  - _header-day2.html
+include-after-body: ../theme/_footer.html
+---
+
+```{python}
+#| label: setup
+#| include: false
+
+import pandas as pd
+import numpy as np
+import plotly.express as px
+import plotly.graph_objects as go
+import plotly.io as pio
+from scipy import stats
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
+from sklearn.linear_model import LinearRegression
+from IPython.display import display, HTML
+import warnings
+warnings.filterwarnings('ignore')
+
+# ---- CRITICAL: Use local Plotly JS, not CDN ----
+pio.renderers.default = 'notebook'
+
+def show(fig, height=350):
+    """Render chart using LOCAL plotly.js (no CDN dependency)."""
+    fig.update_layout(
+        margin=dict(t=30, b=30, l=50, r=20),
+        height=height,
+        template='plotly_white'
+    )
+    # include_plotlyjs=False because we loaded it in the HTML header
+    display(HTML(fig.to_html(include_plotlyjs=False, full_html=False)))
+
+COLORS = {
+    'revenue': '#2D6A4F', 'expenditure': '#E63946', 'debt': '#457B9D',
+    'tax': '#E9C46A', 'education': '#2D6A4F', 'health': '#E63946',
+    'welfare': '#457B9D', 'transport': '#F4A261',
+    'c1': '#2D6A4F', 'c2': '#F4A261', 'c3': '#E63946'
+}
+TEMPLATE = 'plotly_white'
+
+STATE_ABBREV = {
+    'ALABAMA':'AL','ALASKA':'AK','ARIZONA':'AZ','ARKANSAS':'AR','CALIFORNIA':'CA',
+    'COLORADO':'CO','CONNECTICUT':'CT','DELAWARE':'DE','FLORIDA':'FL','GEORGIA':'GA',
+    'HAWAII':'HI','IDAHO':'ID','ILLINOIS':'IL','INDIANA':'IN','IOWA':'IA',
+    'KANSAS':'KS','KENTUCKY':'KY','LOUISIANA':'LA','MAINE':'ME','MARYLAND':'MD',
+    'MASSACHUSETTS':'MA','MICHIGAN':'MI','MINNESOTA':'MN','MISSISSIPPI':'MS',
+    'MISSOURI':'MO','MONTANA':'MT','NEBRASKA':'NE','NEVADA':'NV',
+    'NEW HAMPSHIRE':'NH','NEW JERSEY':'NJ','NEW MEXICO':'NM','NEW YORK':'NY',
+    'NORTH CAROLINA':'NC','NORTH DAKOTA':'ND','OHIO':'OH','OKLAHOMA':'OK',
+    'OREGON':'OR','PENNSYLVANIA':'PA','RHODE ISLAND':'RI','SOUTH CAROLINA':'SC',
+    'SOUTH DAKOTA':'SD','TENNESSEE':'TN','TEXAS':'TX','UTAH':'UT','VERMONT':'VT',
+    'VIRGINIA':'VA','WASHINGTON':'WA','WEST VIRGINIA':'WV','WISCONSIN':'WI','WYOMING':'WY'
+}
+
+# ---- LOAD ----
+url = "https://corgis-edu.github.io/corgis/datasets/csv/finance/finance.csv"
+try:
+    df = pd.read_csv(url)
+except:
+    df = pd.read_csv("finance.csv")
+
+data = df.copy()
+data.columns = data.columns.str.strip()
+
+# ---- FIND COLUMNS ----
+cols = data.columns.tolist()
+
+def find_col(keywords, exclude=None):
+    exclude = exclude or []
+    for c in cols:
+        cl = c.lower()
+        if all(k.lower() in cl for k in keywords):
+            if not any(ex.lower() in cl for ex in exclude):
+                return c
+    return None
+
+rev_c = find_col(['Totals','Revenue'], ['Intergovernmental']) or 'Totals.Revenue'
+exp_c = find_col(['Totals','Expenditure']) or 'Totals.Expenditure'
+tax_c = find_col(['Totals','Tax']) or 'Totals.Tax'
+debt_c = find_col(['Debt','end']) or find_col(['Totals','Debt']) or 'Totals.Debt at end of fiscal year'
+edu_c = find_col(['Education','Total']) or 'Details.Education.Education Total'
+health_c = find_col(['Health','Total','Expenditure']) or 'Details.Health.Health Total Expenditure'
+highway_c = find_col(['Highway','Total']) or 'Details.Transportation.Highways.Highways Total Expenditure'
+welfare_c = find_col(['Welfare','Total']) or 'Details.Welfare.Welfare Institution Total Expenditure'
+
+rename_map = {
+    'State':'state', 'Year':'year',
+    rev_c:'revenue', exp_c:'expenditure', tax_c:'tax', debt_c:'debt',
+    edu_c:'education', health_c:'health', highway_c:'highways', welfare_c:'welfare'
+}
+rename_filtered = {k:v for k,v in rename_map.items() if k in data.columns}
+data.rename(columns=rename_filtered, inplace=True)
+
+# ---- CLEAN ----
+data['state'] = data['state'].astype(str).str.strip().str.upper()
+
+for col in ['revenue','expenditure','tax','debt','education','health','highways','welfare','year']:
+    if col in data.columns:
+        if data[col].dtype == 'object':
+            data[col] = data[col].astype(str).str.replace(',','',regex=False).str.strip()
+            data[col] = data[col].replace(['','nan','NaN','NA','N/A','null','None','-'], np.nan)
+        data[col] = pd.to_numeric(data[col], errors='coerce')
+
+data = data.dropna(subset=['state','year','revenue','expenditure'])
+
+for col in ['education','health','highways','welfare','debt','tax']:
+    if col in data.columns:
+        data[col] = data[col].fillna(0)
+
+# ---- BILLIONS ----
+for c in ['revenue','expenditure','tax','debt','education','health','highways','welfare']:
+    if c in data.columns:
+        data[f'{c}_b'] = data[c] / 1e9
+
+# ---- DERIVED METRICS (safe) ----
+data['budget_balance_b'] = (data['revenue'] - data['expenditure']) / 1e9
+
+data['debt_ratio'] = np.where(data['revenue'] > 0, (data['debt'] / data['revenue']) * 100, 0.0)
+data['debt_ratio'] = data['debt_ratio'].replace([np.inf, -np.inf], 0.0).clip(0, 1000)
+
+data['education_share'] = np.where(data['expenditure'] > 0, (data['education'] / data['expenditure']) * 100, 0.0)
+data['education_share'] = data['education_share'].replace([np.inf, -np.inf], 0.0).clip(0, 100)
+
+data['health_share'] = np.where(data['expenditure'] > 0, (data['health'] / data['expenditure']) * 100, 0.0)
+data['health_share'] = data['health_share'].replace([np.inf, -np.inf], 0.0).clip(0, 100)
+
+data['tax_pct'] = np.where(data['revenue'] > 0, (data['tax'] / data['revenue']) * 100, 0.0)
+data['tax_pct'] = data['tax_pct'].replace([np.inf, -np.inf], 0.0).clip(0, 100)
+
+# ---- FINAL SAFETY ----
+for col in data.select_dtypes(include=[np.number]).columns:
+    data[col] = data[col].replace([np.inf, -np.inf], np.nan).fillna(0)
+
+data['state_abbrev'] = data['state'].map(STATE_ABBREV)
+max_year = int(data['year'].max())
+latest = data[(data['year'] == max_year) & (data['revenue'] > 0)].copy()
+
+# ---- KPIs ----
+total_rev = latest['revenue'].sum()
+total_exp = latest['expenditure'].sum()
+total_debt = latest['debt'].sum()
+avg_debt_ratio = latest['debt_ratio'].mean()
+avg_edu_share = latest['education_share'].mean()
+n_states = latest['state'].nunique()
+n_years = data['year'].nunique()
+min_year = int(data['year'].min())
+
+# ---- STAT TESTS ----
+td = latest[['education_share','debt_ratio']].replace(0, np.nan).dropna()
+if len(td) > 2:
+    corr_edu_debt, p_edu_debt = stats.pearsonr(td['education_share'], td['debt_ratio'])
+else:
+    corr_edu_debt, p_edu_debt = 0.0, 1.0
+
+# ---- CLUSTERING ----
+cf = ['revenue_b','expenditure_b','debt_ratio','education_share','health_share']
+cld = latest[cf].replace([np.inf,-np.inf], np.nan).dropna()
+
+cld_l = pd.DataFrame()
+if len(cld) >= 10:
+    sc = StandardScaler()
+    Xs = sc.fit_transform(cld)
+    km = KMeans(n_clusters=3, random_state=42, n_init=10)
+    clbl = km.fit_predict(Xs)
+    cld_l = cld.copy()
+    cld_l['Cluster'] = clbl
+    cld_l['state'] = latest.loc[cld.index, 'state'].values
+    cld_l['state_abbrev'] = latest.loc[cld.index, 'state_abbrev'].values
+    cm_vals = cld_l.groupby('Cluster')['revenue_b'].mean()
+    sc_cl = cm_vals.sort_values()
+    cn = {}
+    nms = ['Lean & Constrained','Balanced & Growing','High-Spend / High-Revenue']
+    for i, (cid, _) in enumerate(sc_cl.items()):
+        cn[cid] = nms[i]
+    cld_l['Profile'] = cld_l['Cluster'].map(cn)
+
+# ---- REGRESSION ----
+rf = ['education','health','highways','welfare']
+rd = latest[rf + ['debt']].replace([np.inf,-np.inf], np.nan).dropna()
+rd = rd[(rd > 0).all(axis=1)]
+
+if len(rd) > 5:
+    Xr = rd[rf] / 1e9
+    yr = rd['debt'] / 1e9
+    lr = LinearRegression()
+    lr.fit(Xr, yr)
+    reg_coefs = pd.DataFrame({
+        'Feature': ['Education','Health','Highways','Welfare'],
+        'Coefficient': lr.coef_
+    }).sort_values('Coefficient')
+    r2_score = lr.score(Xr, yr)
+else:
+    reg_coefs = pd.DataFrame({'Feature': ['N/A'], 'Coefficient': [0]})
+    r2_score = 0.0
+
+def fmt(fig, height=350):
+    fig.update_layout(margin=dict(t=30, b=30, l=50, r=20), height=height, template=TEMPLATE)
+    return fig
+```
+
+::: {.panel-tabset}
+
+## 📊 Overview
+
+```{python}
+#| output: asis
+kpis = [
+    ("💰", f"${total_rev/1e12:.2f}T", "Total Revenue", "#2D6A4F", f"All {n_states} states ({max_year})"),
+    ("💸", f"${total_exp/1e12:.2f}T", "Total Expenditure", "#E63946", f"All {n_states} states ({max_year})"),
+    ("🏦", f"${total_debt/1e12:.2f}T", "Outstanding Debt", "#457B9D", f"End of FY {max_year}"),
+    ("📊", f"{avg_debt_ratio:.0f}%", "Avg Debt Ratio", "#E9C46A", "Debt / Revenue x 100"),
+    ("🏫", f"{avg_edu_share:.0f}%", "Avg Education Share", "#2D6A4F", "Education / Expenditure"),
+    ("📅", f"{n_states} x {n_years}", "States x Years", "#264653", f"{min_year} - {max_year}"),
+]
+html = '<div class="section-label">Key Performance Indicators</div>\n<div class="kpi-row">\n'
+for icon, value, label, color, sub in kpis:
+    html += f'''<div class="kpi-card" style="--kpi-color: {color};">
+<div class="kpi-icon">{icon}</div>
+<div class="kpi-value">{value}</div>
+<div class="kpi-label">{label}</div>
+<div class="kpi-sub">{sub}</div>
+</div>\n'''
+html += '</div>'
+print(html)
+```
+
+```{python}
+#| output: asis
+print('<div class="section-label">State Comparisons</div>')
+print('<div class="chart-row cols-2">')
+
+# --- Chart 1: Top 10 ---
+print('''<div class="chart-card">
+<div class="card-head">
+<div><div class="card-title">🏛️ Top 10 States by Expenditure</div>
+<div class="card-sub">Horizontal bar — largest state budgets</div></div>
+<span class="badge-chart badge-bar">Bar Chart</span>
+</div><div class="card-body-chart">''')
+```
+
+```{python}
+top10 = latest.nlargest(10, 'expenditure_b').sort_values('expenditure_b')
+fig = px.bar(top10, y='state', x='expenditure_b', orientation='h',
+             color='expenditure_b', color_continuous_scale='Greens',
+             text=top10['expenditure_b'].apply(lambda x: f'${x:.1f}B'),
+             labels={'expenditure_b':'Expenditure ($B)', 'state':''})
+fig.update_traces(textposition='outside')
+fig.update_layout(coloraxis_showscale=False, yaxis_title='')
+show(fig, 380)
+```
+
+```{python}
+#| output: asis
+print('</div></div>')  # close card-body-chart and chart-card
+
+# --- Chart 2: Scatter ---
+print('''<div class="chart-card">
+<div class="card-head">
+<div><div class="card-title">💸 Revenue vs Debt Ratio by State</div>
+<div class="card-sub">Bubble size = expenditure · color = education share</div></div>
+<span class="badge-chart badge-scatter">Scatter</span>
+</div><div class="card-body-chart">''')
+```
+
+```{python}
+sl = latest[(latest['revenue_b'] > 0) & (latest['debt_ratio'] > 0)].copy()
+fig = px.scatter(sl, x='revenue_b', y='debt_ratio', size='expenditure_b',
+                 color='education_share', hover_name='state', size_max=40,
+                 opacity=0.7, color_continuous_scale='RdYlGn',
+                 labels={'revenue_b':'Revenue ($B)', 'debt_ratio':'Debt Ratio (%)',
+                         'expenditure_b':'Expenditure ($B)', 'education_share':'Edu Share %'})
+show(fig, 380)
+```
+
+```{python}
+#| output: asis
+print('</div></div>')  # close card-body-chart and chart-card
+print('</div>')  # close chart-row
+```
+
+```{python}
+#| output: asis
+print('<div class="section-label">Map and Distribution</div>')
+print('<div class="chart-row cols-2-1">')
+
+# --- Choropleth ---
+print('''<div class="chart-card">
+<div class="card-head">
+<div><div class="card-title">🗺️ Expenditure by State — Choropleth</div>
+<div class="card-sub">Interactive map · hover for details</div></div>
+<span class="badge-chart badge-map">Choropleth</span>
+</div><div class="card-body-chart tall">''')
+```
+
+```{python}
+md = latest.dropna(subset=['state_abbrev'])
+fig = px.choropleth(md, locations='state_abbrev', locationmode='USA-states',
+                    color='expenditure_b', scope='usa', color_continuous_scale='Greens',
+                    hover_name='state',
+                    hover_data={'revenue_b':':.1f','expenditure_b':':.1f','debt_ratio':':.0f'},
+                    labels={'expenditure_b':'Expenditure ($B)','revenue_b':'Revenue ($B)',
+                            'debt_ratio':'Debt Ratio %'})
+fig.update_layout(geo=dict(bgcolor='rgba(0,0,0,0)'))
+show(fig, 420)
+```
+
+```{python}
+#| output: asis
+print('</div></div>')
+
+# --- Histogram ---
+print('''<div class="chart-card">
+<div class="card-head">
+<div><div class="card-title">📊 Debt Ratio Distribution</div>
+<div class="card-sub">Histogram across all states</div></div>
+<span class="badge-chart badge-histogram">Histogram</span>
+</div><div class="card-body-chart tall">''')
+```
+
+```{python}
+hd = latest[latest['debt_ratio'] > 0]
+fig = px.histogram(hd, x='debt_ratio', nbins=20,
+                   color_discrete_sequence=[COLORS['debt']],
+                   labels={'debt_ratio':'Debt Ratio (%)'})
+if len(hd) > 0:
+    m = hd['debt_ratio'].mean()
+    fig.add_vline(x=m, line_dash='dash', line_color=COLORS['expenditure'],
+                  annotation_text=f'Mean: {m:.0f}%')
+fig.update_layout(yaxis_title='Number of States', showlegend=False)
+show(fig, 420)
+```
+
+```{python}
+#| output: asis
+print('</div></div>')
+print('</div>')  # close chart-row
+```
+
+
+## 📈 Trends
+
+```{python}
+#| output: asis
+print('<div class="section-label">National Fiscal Trends</div>')
+print('<div class="chart-row cols-2">')
+
+print('''<div class="chart-card">
+<div class="card-head">
+<div><div class="card-title">📈 National Revenue vs Expenditure</div>
+<div class="card-sub">All states aggregated · shaded gap</div></div>
+<span class="badge-chart badge-area">Area / Line</span>
+</div><div class="card-body-chart">''')
+```
+
+```{python}
+nat = data.groupby('year').agg(
+    revenue=('revenue_b','sum'),
+    expenditure=('expenditure_b','sum')
+).reset_index()
+
+fig = go.Figure()
+fig.add_trace(go.Scatter(x=nat['year'], y=nat['revenue'], name='Revenue',
+              fill='tozeroy', line=dict(color=COLORS['revenue'], width=2),
+              fillcolor='rgba(45,106,79,0.15)'))
+fig.add_trace(go.Scatter(x=nat['year'], y=nat['expenditure'], name='Expenditure',
+              fill='tozeroy', line=dict(color=COLORS['expenditure'], width=2),
+              fillcolor='rgba(230,57,70,0.15)'))
+fig.add_vline(x=2008, line_dash='dot', line_color='gray',
+              annotation_text='2008 Crisis', annotation_font_size=9)
+fig.update_layout(yaxis_title='$ Billions', xaxis_title='Year',
+                  legend=dict(orientation='h', y=1.05))
+show(fig)
+```
+
+```{python}
+#| output: asis
+print('</div></div>')
+
+print('''<div class="chart-card">
+<div class="card-head">
+<div><div class="card-title">🏦 National Debt Trend</div>
+<div class="card-sub">Total outstanding debt over time</div></div>
+<span class="badge-chart badge-area">Area</span>
+</div><div class="card-body-chart">''')
+```
+
+```{python}
+nat_debt = data.groupby('year')['debt'].sum().reset_index()
+nat_debt['debt_b'] = nat_debt['debt'] / 1e9
+
+fig = px.area(nat_debt, x='year', y='debt_b',
+              color_discrete_sequence=[COLORS['debt']],
+              labels={'debt_b':'Outstanding Debt ($B)', 'year':'Year'})
+fig.add_vline(x=2008, line_dash='dot', line_color='gray',
+              annotation_text='2008 Crisis', annotation_font_size=9)
+show(fig)
+```
+
+```{python}
+#| output: asis
+print('</div></div>')
+print('</div>')  # close chart-row
+```
+
+```{python}
+#| output: asis
+print('<div class="section-label">State-Level Trends</div>')
+print('<div class="chart-row cols-2">')
+
+print('''<div class="chart-card">
+<div class="card-head">
+<div><div class="card-title">📈 Revenue vs Expenditure — Top 5 States</div>
+<div class="card-sub">Faceted line charts</div></div>
+<span class="badge-chart badge-line">Faceted Line</span>
+</div><div class="card-body-chart tall">''')
+```
+
+```{python}
+t5 = latest.nlargest(5, 'expenditure')['state'].tolist()
+t5d = data[data['state'].isin(t5)].melt(
+    id_vars=['state','year'],
+    value_vars=['revenue_b','expenditure_b'],
+    var_name='Metric', value_name='Dollars_B'
+)
+t5d['Metric'] = t5d['Metric'].map({'revenue_b':'Revenue','expenditure_b':'Expenditure'})
+
+fig = px.line(t5d, x='year', y='Dollars_B', color='Metric',
+              facet_col='state', facet_col_wrap=3,
+              color_discrete_map={'Revenue':COLORS['revenue'],
+                                   'Expenditure':COLORS['expenditure']},
+              labels={'year':'Year', 'Dollars_B':'$ Billions'})
+fig.for_each_annotation(lambda a: a.update(text=a.text.split("=")[-1]))
+show(fig, 420)
+```
+
+```{python}
+#| output: asis
+print('</div></div>')
+
+print('''<div class="chart-card">
+<div class="card-head">
+<div><div class="card-title">⚖️ Budget Balance — Top 5 States</div>
+<div class="card-sub">Green = surplus · red = deficit</div></div>
+<span class="badge-chart badge-bar">Bar</span>
+</div><div class="card-body-chart tall">''')
+```
+
+```{python}
+t5b = data[data['state'].isin(t5)].copy()
+t5b = t5b[np.isfinite(t5b['budget_balance_b'])]
+
+fig = px.bar(t5b, x='year', y='budget_balance_b', color='state',
+             barmode='group', color_discrete_sequence=px.colors.qualitative.Set2,
+             labels={'budget_balance_b':'Balance ($B)', 'year':'Year', 'state':'State'})
+fig.add_hline(y=0, line_dash='solid', line_color='black', line_width=1)
+fig.update_layout(legend=dict(orientation='h', y=1.05))
+show(fig, 420)
+```
+
+```{python}
+#| output: asis
+print('</div></div>')
+print('</div>')
+```
+
+
+## 🏛️ Sectors
+
+```{python}
+#| output: asis
+print('<div class="section-label">Sector Spending Allocation</div>')
+print('<div class="chart-row cols-2">')
+
+print('''<div class="chart-card">
+<div class="card-head">
+<div><div class="card-title">🏛️ Spending by Sector — Top 10 States</div>
+<div class="card-sub">Education, Health, Welfare, Transportation</div></div>
+<span class="badge-chart badge-stacked">Stacked Bar</span>
+</div><div class="card-body-chart tall">''')
+```
+
+```{python}
+t10s = latest.nlargest(10, 'expenditure').melt(
+    id_vars=['state'],
+    value_vars=['education','health','highways','welfare'],
+    var_name='Sector', value_name='Amount'
+)
+t10s['Dollars_B'] = t10s['Amount'] / 1e9
+t10s['Sector'] = t10s['Sector'].str.title()
+
+fig = px.bar(t10s, y='state', x='Dollars_B', color='Sector',
+             orientation='h', barmode='stack',
+             color_discrete_map={'Education':COLORS['education'],
+                                  'Health':COLORS['health'],
+                                  'Highways':COLORS['transport'],
+                                  'Welfare':COLORS['welfare']},
+             labels={'Dollars_B':'Spending ($B)', 'state':''})
+fig.update_layout(yaxis_title='', legend=dict(orientation='h', y=1.05))
+show(fig, 420)
+```
+
+```{python}
+#| output: asis
+print('</div></div>')
+
+print('''<div class="chart-card">
+<div class="card-head">
+<div><div class="card-title">📈 Sector Spending Trends (National)</div>
+<div class="card-sub">Key sectors over time</div></div>
+<span class="badge-chart badge-area">Stacked Area</span>
+</div><div class="card-body-chart tall">''')
+```
+
+```{python}
+st = data.groupby('year').agg(
+    Education=('education','sum'), Health=('health','sum'),
+    Highways=('highways','sum'), Welfare=('welfare','sum')
+).reset_index()
+for c in ['Education','Health','Highways','Welfare']:
+    st[c] = st[c] / 1e9
+
+fig = px.area(st, x='year', y=['Education','Health','Welfare','Highways'],
+              color_discrete_map={'Education':COLORS['education'],
+                                   'Health':COLORS['health'],
+                                   'Highways':COLORS['transport'],
+                                   'Welfare':COLORS['welfare']},
+              labels={'value':'$B', 'year':'Year', 'variable':'Sector'})
+fig.update_layout(legend=dict(orientation='h', y=1.05))
+show(fig, 420)
+```
+
+```{python}
+#| output: asis
+print('</div></div>')
+print('</div>')
+```
+
+```{python}
+#| output: asis
+print('<div class="section-label">Composition and Maps</div>')
+print('<div class="chart-row cols-3">')
+
+print('''<div class="chart-card">
+<div class="card-head">
+<div><div class="card-title">🍩 Expenditure Composition</div>
+<div class="card-sub">National sector shares</div></div>
+<span class="badge-chart badge-donut">Donut</span>
+</div><div class="card-body-chart">''')
+```
+
+```{python}
+sv = latest[['education','health','highways','welfare']].sum() / 1e9
+fig = go.Figure(go.Pie(
+    labels=['Education','Health','Highways','Welfare'],
+    values=sv.values, hole=0.55,
+    marker=dict(colors=[COLORS['education'], COLORS['health'],
+                        COLORS['transport'], COLORS['welfare']],
+                line=dict(color='white', width=3)),
+    textinfo='label+percent', textfont_size=11
+))
+fig.update_layout(
+    annotations=[dict(text=f"<b>{max_year}</b><br>Mix",
+                       x=0.5, y=0.5, font_size=14, showarrow=False)]
+)
+show(fig, 320)
+```
+
+```{python}
+#| output: asis
+print('</div></div>')
+
+print('''<div class="chart-card">
+<div class="card-head">
+<div><div class="card-title">🗺️ Education Share by State</div>
+<div class="card-sub">% of expenditure on education</div></div>
+<span class="badge-chart badge-map">Choropleth</span>
+</div><div class="card-body-chart">''')
+```
+
+```{python}
+fig = px.choropleth(md, locations='state_abbrev', locationmode='USA-states',
+                    color='education_share', scope='usa',
+                    color_continuous_scale='YlGn', hover_name='state',
+                    labels={'education_share':'Education %'})
+fig.update_layout(geo=dict(bgcolor='rgba(0,0,0,0)'))
+show(fig, 320)
+```
+
+```{python}
+#| output: asis
+print('</div></div>')
+
+print('''<div class="chart-card">
+<div class="card-head">
+<div><div class="card-title">🔗 Correlation Heatmap</div>
+<div class="card-sub">Key fiscal variables</div></div>
+<span class="badge-chart badge-heatmap">Heatmap</span>
+</div><div class="card-body-chart">''')
+```
+
+```{python}
+cc = ['revenue_b','expenditure_b','debt_ratio','tax_pct','education_share','health_share']
+cl = ['Revenue','Expend.','Debt %','Tax %','Edu %','Health %']
+corr_matrix = latest[cc].corr().round(2)
+corr_matrix.index = cl
+corr_matrix.columns = cl
+
+fig = px.imshow(corr_matrix, text_auto=True, color_continuous_scale='RdBu_r',
+                zmin=-1, zmax=1, labels=dict(color='r'))
+show(fig, 320)
+```
+
+```{python}
+#| output: asis
+print('</div></div>')
+print('</div>')
+```
+
+
+## 🤖 ML Insights
+
+```{python}
+#| output: asis
+print('''<div class="callout-custom" style="--callout-color: #1B4332;">
+<div class="callout-title">☁️ Cloud &amp; Production Architecture</div>
+This fiscal analytics platform can be productionized using <strong>Azure Data Factory</strong> for Census data ingestion,
+<strong>Google BigQuery / Azure Synapse</strong> for the data warehouse,
+<strong>Azure ML / SageMaker</strong> for revenue forecasting,
+and <strong>Power BI Service</strong> for dashboards. Model versioning via <strong>MLflow</strong>.
+</div>''')
+```
+
+```{python}
+#| output: asis
+print('<div class="section-label">State Fiscal Clustering</div>')
+print('<div class="chart-row cols-2">')
+
+print('''<div class="chart-card">
+<div class="card-head">
+<div><div class="card-title">🤖 K-Means: State Fiscal Profiles</div>
+<div class="card-sub">3 clusters · bubble = expenditure</div></div>
+<span class="badge-chart badge-cluster">Clustering</span>
+</div><div class="card-body-chart tall">''')
+```
+
+```{python}
+if len(cld_l) > 0:
+    pc = {'High-Spend / High-Revenue': COLORS['c1'],
+          'Balanced & Growing': COLORS['c2'],
+          'Lean & Constrained': COLORS['c3']}
+    fig = px.scatter(cld_l, x='revenue_b', y='debt_ratio',
+                     size='expenditure_b', color='Profile',
+                     hover_name='state', size_max=35, opacity=0.7,
+                     color_discrete_map=pc,
+                     labels={'revenue_b':'Revenue ($B)',
+                             'debt_ratio':'Debt Ratio %',
+                             'expenditure_b':'Exp ($B)'})
+    show(fig, 420)
+else:
+    print("Not enough data for clustering.")
+```
+
+```{python}
+#| output: asis
+print('</div></div>')
+
+print('''<div class="chart-card">
+<div class="card-head">
+<div><div class="card-title">📈 What Predicts State Debt?</div>
+<div class="card-sub">Linear regression coefficients</div></div>
+<span class="badge-chart badge-bar">Regression</span>
+</div><div class="card-body-chart tall">''')
+```
+
+```{python}
+fig = px.bar(reg_coefs, y='Feature', x='Coefficient', orientation='h',
+             color='Coefficient', color_continuous_scale='RdYlGn_r',
+             text=reg_coefs['Coefficient'].apply(lambda x: f'{x:.2f}'),
+             labels={'Coefficient':'Coefficient', 'Feature':'Spending Category'})
+fig.update_traces(textposition='outside')
+fig.update_layout(coloraxis_showscale=False,
+                  title=dict(text=f'R2 = {r2_score:.2f}', font=dict(size=12), x=0.5))
+show(fig, 420)
+```
+
+```{python}
+#| output: asis
+print('</div></div>')
+print('</div>')
+```
+
+```{python}
+#| output: asis
+print('<div class="section-label">Cluster Profiles</div>')
+
+if len(cld_l) > 0:
+    ps = cld_l.groupby('Profile').agg(
+        States=('state','count'),
+        Avg_Revenue=('revenue_b','mean'),
+        Avg_Expenditure=('expenditure_b','mean'),
+        Avg_Debt_Ratio=('debt_ratio','mean'),
+        Avg_Edu_Share=('education_share','mean')
+    ).round(1)
+
+    row_colors = {'High-Spend / High-Revenue':'#f0fdf4',
+                  'Balanced & Growing':'#fff7ed',
+                  'Lean & Constrained':'#fef2f2'}
+    border_colors = {'High-Spend / High-Revenue':'#2D6A4F',
+                     'Balanced & Growing':'#F4A261',
+                     'Lean & Constrained':'#E63946'}
+
+    html = '''<table class="profile-table">
+    <thead><tr style="background:#1B4332;">
+    <th style="text-align:left;">Fiscal Profile</th>
+    <th>States</th><th>Avg Revenue ($B)</th>
+    <th>Avg Expenditure ($B)</th><th>Debt Ratio %</th><th>Edu Share %</th>
+    </tr></thead><tbody>'''
+
+    for profile, row in ps.iterrows():
+        bg = row_colors.get(profile, 'white')
+        bc = border_colors.get(profile, '#888')
+        html += f'''<tr style="background:{bg};">
+        <td style="text-align:left; padding:8px; border-left:4px solid {bc};"><strong>{profile}</strong></td>
+        <td>{int(row['States'])}</td>
+        <td>${row['Avg_Revenue']:.1f}B</td>
+        <td>${row['Avg_Expenditure']:.1f}B</td>
+        <td>{row['Avg_Debt_Ratio']:.0f}%</td>
+        <td>{row['Avg_Edu_Share']:.0f}%</td>
+        </tr>'''
+
+    html += '</tbody></table>'
+    print(html)
+```
+
+```{python}
+#| output: asis
+direction = 'Negative' if corr_edu_debt < 0 else 'Positive'
+strength = 'strong' if abs(corr_edu_debt) > 0.5 else 'moderate' if abs(corr_edu_debt) > 0.3 else 'weak'
+
+print(f'''
+<div class="section-label" style="margin-top:20px;">Key Insights and Architecture</div>
+
+<div class="insight-grid" style="margin-bottom:20px;">
+<div class="insight-card" style="--insight-color:#2D6A4F;">
+<strong>1. Revenue Growth</strong>
+National state revenue grew ~3x from {min_year} to {max_year}.
+</div>
+<div class="insight-card" style="--insight-color:#E63946;">
+<strong>2. Debt Acceleration</strong>
+Debt outpaced revenue — avg debt ratio {avg_debt_ratio:.0f}%.
+</div>
+<div class="insight-card" style="--insight-color:#457B9D;">
+<strong>3. Education Dominates</strong>
+~{avg_edu_share:.0f}% of state spending goes to education.
+</div>
+<div class="insight-card" style="--insight-color:#F4A261;">
+<strong>4. Education-Debt Link</strong>
+Pearson r={corr_edu_debt:.2f} (p={p_edu_debt:.4f}) — {direction} {strength}.
+</div>
+</div>
+
+<table class="arch-table">
+<thead><tr style="background:#1B4332;">
+<th>Layer</th><th>Technology</th><th>Purpose</th></tr></thead>
+<tbody>
+<tr><td>📥 Ingestion</td><td>Azure Data Factory / AWS Glue</td><td>Census Bureau API</td></tr>
+<tr><td>🗄️ Storage</td><td>BigQuery / Azure Synapse</td><td>Fiscal data warehouse</td></tr>
+<tr><td>🤖 ML</td><td>Azure ML / SageMaker / MLflow</td><td>Revenue forecasting</td></tr>
+<tr><td>⚡ Processing</td><td>Databricks / PySpark</td><td>Large-scale fiscal processing</td></tr>
+<tr><td>📊 Viz</td><td>Power BI Service / Tableau</td><td>Interactive dashboards with RLS</td></tr>
+</tbody></table>
+''')
+```
+
+:::
